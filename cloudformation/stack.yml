@@ -1,0 +1,360 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: PocketBase on ECS Fargate with EFS persistent storage
+
+Parameters:
+  LaunchType:
+    Type: String
+    Default: x86
+    AllowedValues:
+      - x86
+      - arm
+      - spot-x86
+      - spot-arm
+    Description: "Compute architecture and capacity type. x86/arm = on-demand Fargate; spot-x86/spot-arm = Fargate Spot"
+
+Mappings:
+  LaunchConfig:
+    x86:
+      CpuArch: X86_64
+      CapacityProvider: FARGATE
+    arm:
+      CpuArch: ARM64
+      CapacityProvider: FARGATE
+    spot-x86:
+      CpuArch: X86_64
+      CapacityProvider: FARGATE_SPOT
+    spot-arm:
+      CpuArch: ARM64
+      CapacityProvider: FARGATE_SPOT
+
+Resources:
+
+  # ── VPC ──────────────────────────────────────────────────────────────────
+
+  Vpc:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.0.0.0/16
+      EnableDnsHostnames: true
+      EnableDnsSupport: true
+      Tags:
+        - Key: Name
+          Value: pocketbase
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - Key: Name
+          Value: pocketbase
+
+  VpcGatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref Vpc
+      InternetGatewayId: !Ref InternetGateway
+
+  PublicSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: 10.0.1.0/24
+      AvailabilityZone: !Select [0, !GetAZs ""]
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: pocketbase-public-1
+
+  PublicSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: 10.0.2.0/24
+      AvailabilityZone: !Select [1, !GetAZs ""]
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: pocketbase-public-2
+
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref Vpc
+
+  PublicRoute:
+    Type: AWS::EC2::Route
+    DependsOn: VpcGatewayAttachment
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  Subnet1RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet1
+      RouteTableId: !Ref PublicRouteTable
+
+  Subnet2RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet2
+      RouteTableId: !Ref PublicRouteTable
+
+  # ── Security Groups ───────────────────────────────────────────────────────
+  # Defined in dependency order (ALB → ECS → EFS) to avoid circular refs.
+  # All three use AWS default egress (allow all outbound).
+
+  AlbSg:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: ALB - inbound HTTP from internet
+      VpcId: !Ref Vpc
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+
+  EcsSg:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: ECS tasks - inbound from ALB
+      VpcId: !Ref Vpc
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 8080
+          ToPort: 8080
+          SourceSecurityGroupId: !Ref AlbSg
+
+  EfsSg:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: EFS mount targets - NFS from ECS tasks
+      VpcId: !Ref Vpc
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 2049
+          ToPort: 2049
+          SourceSecurityGroupId: !Ref EcsSg
+
+  # ── ECR ───────────────────────────────────────────────────────────────────
+
+  EcrRepository:
+    Type: AWS::ECR::Repository
+    Properties:
+      RepositoryName: pocketbase
+      ImageScanningConfiguration:
+        ScanOnPush: true
+
+  # ── EFS ───────────────────────────────────────────────────────────────────
+
+  EfsFileSystem:
+    Type: AWS::EFS::FileSystem
+    Properties:
+      Encrypted: true
+      PerformanceMode: generalPurpose
+      ThroughputMode: bursting
+
+  EfsMountTarget1:
+    Type: AWS::EFS::MountTarget
+    Properties:
+      FileSystemId: !Ref EfsFileSystem
+      SubnetId: !Ref PublicSubnet1
+      SecurityGroups:
+        - !Ref EfsSg
+
+  EfsMountTarget2:
+    Type: AWS::EFS::MountTarget
+    Properties:
+      FileSystemId: !Ref EfsFileSystem
+      SubnetId: !Ref PublicSubnet2
+      SecurityGroups:
+        - !Ref EfsSg
+
+  EfsAccessPoint:
+    Type: AWS::EFS::AccessPoint
+    Properties:
+      FileSystemId: !Ref EfsFileSystem
+      RootDirectory:
+        Path: /pocketbase
+        CreationInfo:
+          OwnerUid: "0"
+          OwnerGid: "0"
+          Permissions: "755"
+      PosixUser:
+        Uid: "0"
+        Gid: "0"
+
+  # ── IAM ───────────────────────────────────────────────────────────────────
+
+  TaskExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy
+
+  TaskRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: EfsAccess
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - elasticfilesystem:ClientMount
+                  - elasticfilesystem:ClientWrite
+                  - elasticfilesystem:ClientRootAccess
+                Resource: !GetAtt EfsFileSystem.Arn
+
+  # ── CloudWatch ────────────────────────────────────────────────────────────
+
+  LogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: /ecs/pocketbase
+      RetentionInDays: 7
+
+  # ── ECS ───────────────────────────────────────────────────────────────────
+
+  EcsCluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterName: pocketbase
+      CapacityProviders:
+        - FARGATE
+        - FARGATE_SPOT
+
+  TaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: pocketbase
+      RequiresCompatibilities:
+        - FARGATE
+      NetworkMode: awsvpc
+      Cpu: "256"
+      Memory: "512"
+      ExecutionRoleArn: !GetAtt TaskExecutionRole.Arn
+      TaskRoleArn: !GetAtt TaskRole.Arn
+      RuntimePlatform:
+        CpuArchitecture: !FindInMap [LaunchConfig, !Ref LaunchType, CpuArch]
+        OperatingSystemFamily: LINUX
+      Volumes:
+        - Name: pb-data
+          EFSVolumeConfiguration:
+            FilesystemId: !Ref EfsFileSystem
+            TransitEncryption: ENABLED
+            AuthorizationConfig:
+              AccessPointId: !Ref EfsAccessPoint
+              IAM: ENABLED
+      ContainerDefinitions:
+        - Name: pocketbase
+          Image: !Sub "${EcrRepository.RepositoryUri}:latest"
+          Essential: true
+          PortMappings:
+            - ContainerPort: 8080
+              Protocol: tcp
+          MountPoints:
+            - SourceVolume: pb-data
+              ContainerPath: /pb/pb_data
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref LogGroup
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: ecs
+
+  # ── ALB ───────────────────────────────────────────────────────────────────
+
+  LoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    DependsOn: VpcGatewayAttachment
+    Properties:
+      Name: pocketbase
+      Scheme: internet-facing
+      Type: application
+      Subnets:
+        - !Ref PublicSubnet1
+        - !Ref PublicSubnet2
+      SecurityGroups:
+        - !Ref AlbSg
+
+  TargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: pocketbase
+      Protocol: HTTP
+      Port: 8080
+      VpcId: !Ref Vpc
+      TargetType: ip
+      HealthCheckPath: /api/health
+      HealthCheckIntervalSeconds: 30
+      HealthCheckTimeoutSeconds: 5
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 3
+
+  Listener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref LoadBalancer
+      Protocol: HTTP
+      Port: 80
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref TargetGroup
+
+  # ── ECS Service ───────────────────────────────────────────────────────────
+
+  EcsService:
+    Type: AWS::ECS::Service
+    DependsOn:
+      - Listener
+      - EfsMountTarget1
+      - EfsMountTarget2
+    Properties:
+      ServiceName: pocketbase
+      Cluster: !Ref EcsCluster
+      TaskDefinition: !Ref TaskDefinition
+      DesiredCount: 1
+      CapacityProviderStrategy:
+        - CapacityProvider: !FindInMap [LaunchConfig, !Ref LaunchType, CapacityProvider]
+          Weight: 1
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          Subnets:
+            - !Ref PublicSubnet1
+            - !Ref PublicSubnet2
+          SecurityGroups:
+            - !Ref EcsSg
+          AssignPublicIp: ENABLED
+      LoadBalancers:
+        - ContainerName: pocketbase
+          ContainerPort: 8080
+          TargetGroupArn: !Ref TargetGroup
+      HealthCheckGracePeriodSeconds: 60
+
+Outputs:
+
+  ALBDnsName:
+    Description: "PocketBase URL — admin UI at /pb/_/"
+    Value: !Sub "http://${LoadBalancer.DNSName}"
+
+  ECRRepositoryUri:
+    Description: "Push your image here before deploying: docker push <uri>:latest"
+    Value: !GetAtt EcrRepository.RepositoryUri

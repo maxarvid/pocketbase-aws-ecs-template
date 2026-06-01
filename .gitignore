@@ -1,0 +1,11 @@
+/.vscode/
+.idea
+
+.DS_Store
+
+# goreleaser builds folder
+/.builds/
+
+# tests coverage
+coverage.out
+
