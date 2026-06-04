@@ -1,6 +1,8 @@
 # Pocketbase on AWS ECS Fargate
 This repo serves as an example for deploying Pocketbase to AWS ECS Fargate. There are some caveats, but for small personal projects it has so far been adequate. 
 
+![A diagram representation of the infrastructure](/assets/pocketbase-aws-ecs.svg "Diagram of AWS architecture")
+
 ## The why?
 I enjoy Pocketbase. I enjoy deploying Docker containers. I enjoy the promise of AWS Fargate Spot pricing.
 
